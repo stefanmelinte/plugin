@@ -1,0 +1,147 @@
+name: Build Momentum Music Intel macOS
+
+on:
+  push:
+    branches: [momentum-music-build]
+    paths:
+      - "payload-v3/**"
+      - ".github/workflows/build-momentum.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build-intel-macos:
+    name: Verify and build Mac Intel x64
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      APPLE_SIGNING_IDENTITY: "-"
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+
+    steps:
+      - name: Check out build workspace
+        uses: actions/checkout@v4
+
+      - name: Check out Zuno 1.4.0
+        uses: actions/checkout@v4
+        with:
+          repository: noFAYZ/zuno
+          ref: v1.4.0
+          path: app
+          fetch-depth: 0
+
+      - name: Rebuild and verify Momentum Music patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import lzma
+          from pathlib import Path
+
+          parts = sorted(Path("payload-v3").glob("momentum-music.patch.xz.b64.*"))
+          if len(parts) != 5:
+              raise SystemExit(f"Expected 5 payload chunks, found {len(parts)}")
+
+          compressed = base64.b64decode("".join(part.read_text().strip() for part in parts))
+          compressed_hash = hashlib.sha256(compressed).hexdigest()
+          if compressed_hash != "dd2e53fbebdfc736141f0c515c79419d8cadfcd3b978013d2e9fb7a276240a51":
+              raise SystemExit(f"Unexpected compressed payload SHA-256: {compressed_hash}")
+
+          patch = lzma.decompress(compressed)
+          patch_hash = hashlib.sha256(patch).hexdigest()
+          if patch_hash != "cc5c39204890d7b9068001912377145802157d197c666020c5bf9fdf54ac3d48":
+              raise SystemExit(f"Unexpected patch SHA-256: {patch_hash}")
+
+          Path("/tmp/momentum-music.patch").write_bytes(patch)
+          print(f"Verified {len(patch)} byte patch")
+          PY
+
+      - name: Apply Momentum Music changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd app
+          git apply --index /tmp/momentum-music.patch
+          git diff --cached --check
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Generate Momentum app icons
+        working-directory: app
+        run: npx tauri icon assets/img/momentum/app-icon.svg
+
+      - name: Type-check
+        working-directory: app
+        run: npm run typecheck
+
+      - name: Run source checks
+        working-directory: app
+        run: npm run check
+
+      - name: Build Intel macOS application and DMG
+        working-directory: app
+        run: npx tauri build --target x86_64-apple-darwin --bundles app,dmg
+
+      - name: Verify DMG, signature, and Intel application binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="app/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg"
+          dmg_path="$(find "$bundle_dir" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          hdiutil verify "$dmg_path"
+
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet || true
+            rmdir "$mount_dir" || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse -quiet
+          app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+          file "$app_path/Contents/MacOS/$executable" | tee /tmp/momentum-architecture.txt
+          grep -q 'x86_64' /tmp/momentum-architecture.txt
+          codesign --verify --deep --strict "$app_path"
+
+      - name: Prepare verified installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          dmg_path="$(find app/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          cp "$dmg_path" dist/Momentum_Music_1.0.0_x64.dmg
+          shasum -a 256 dist/Momentum_Music_1.0.0_x64.dmg > dist/Momentum_Music_1.0.0_x64.dmg.sha256
+
+      - name: Upload verified Intel installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Momentum-Music-1.0.0-Mac-Intel
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
