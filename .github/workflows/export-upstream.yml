@@ -1,0 +1,35 @@
+name: Export Zuno 1.4.0 source
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out workspace
+        uses: actions/checkout@v4
+
+      - name: Check out Zuno 1.4.0
+        uses: actions/checkout@v4
+        with:
+          repository: noFAYZ/zuno
+          ref: v1.4.0
+          path: zuno-1.4.0
+
+      - name: Remove nested Git metadata
+        shell: bash
+        run: rm -rf zuno-1.4.0/.git
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: zuno-1.4.0-source
+          path: zuno-1.4.0
+          include-hidden-files: true
+          retention-days: 7
