@@ -40,7 +40,6 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import base64
-          import difflib
           import hashlib
           import json
           import lzma
@@ -49,21 +48,15 @@ jobs:
           from pathlib import Path
 
           payload_dir = Path("payload-v3")
-          first = [payload_dir / f"momentum-music.patch.xz.b64.{index:03d}" for index in range(3)]
-          split_middle = sorted(payload_dir.glob("momentum-music.patch.xz.b64.003.*"))
-          last = payload_dir / "momentum-music.patch.xz.b64.004"
-          if any(not part.exists() for part in [*first, last]) or not split_middle:
+          prefix_parts = [payload_dir / f"momentum-music.patch.xz.b64.{index:03d}" for index in range(3)]
+          suffix_part = payload_dir / "momentum-music.patch.xz.b64.004"
+          if any(not part.exists() for part in [*prefix_parts, suffix_part]):
               raise SystemExit("Momentum Music payload is incomplete")
 
-          prefix = "".join(part.read_text().strip() for part in first)
-          current_middle = "".join(part.read_text().strip() for part in split_middle)
-          suffix = last.read_text().strip()
-          print("Middle chunks:", [(part.name, part.stat().st_size) for part in split_middle])
-          print("Current middle length:", len(current_middle))
+          prefix = "".join(part.read_text().strip() for part in prefix_parts)
+          suffix = suffix_part.read_text().strip()
 
-          # A previous immutable Git blob contains the same 12,000-character middle chunk.
-          # The split upload lost one character, so use sequence alignment only to locate that
-          # omission, then verify the repair against the original full-payload SHA-256.
+          # Recover the original full 12,000-character middle chunk from its immutable Git blob.
           request = urllib.request.Request(
               "https://api.github.com/repos/stefanmelinte/plugin/git/blobs/ca273597bd7f851e7ebe15b05bfb961130af4710",
               headers={
@@ -74,55 +67,66 @@ jobs:
           )
           with urllib.request.urlopen(request) as response:
               old_blob = json.load(response)
-          previous_middle = base64.b64decode(old_blob["content"]).decode("ascii")
-          print("Previous middle length:", len(previous_middle))
-
-          matcher = difflib.SequenceMatcher(None, current_middle, previous_middle, autojunk=False)
-          opcodes = [opcode for opcode in matcher.get_opcodes() if opcode[0] != "equal"]
-          print("Middle differences:", opcodes)
-
-          candidate_positions = set()
-          for tag, i1, i2, j1, j2 in opcodes:
-              if tag == "insert":
-                  candidate_positions.add(i1)
-              elif tag == "replace" and (j2 - j1) > (i2 - i1):
-                  candidate_positions.update(range(i1, i2 + 1))
-          # Include split boundaries as harmless fallbacks in case SequenceMatcher groups a
-          # deletion with a neighbouring replacement.
-          running = 0
-          for part in split_middle:
-              running += len(part.read_text().strip())
-              candidate_positions.update(range(max(0, running - 3), min(len(current_middle), running + 3) + 1))
+          middle = base64.b64decode(old_blob["content"]).decode("ascii")
+          if len(middle) != 12_000:
+              raise SystemExit(f"Unexpected middle chunk length: {len(middle)}")
 
           alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-          expected_compressed = "dd2e53fbebdfc736141f0c515c79419d8cadfcd3b978013d2e9fb7a276240a51"
+          expected_compressed_hex = "dd2e53fbebdfc736141f0c515c79419d8cadfcd3b978013d2e9fb7a276240a51"
+          expected_compressed = bytes.fromhex(expected_compressed_hex)
           expected_patch = "cc5c39204890d7b9068001912377145802157d197c666020c5bf9fdf54ac3d48"
-          repaired = None
-          for position in sorted(candidate_positions):
-              for character in alphabet:
-                  candidate_middle = current_middle[:position] + character + current_middle[position:]
-                  encoded = prefix + candidate_middle + suffix
-                  try:
-                      compressed = base64.b64decode(encoded, validate=True)
-                  except Exception:
-                      continue
-                  if hashlib.sha256(compressed).hexdigest() == expected_compressed:
-                      repaired = (position, character, compressed)
+
+          encoded = prefix + middle + suffix
+          compressed = bytearray(base64.b64decode(encoded, validate=True))
+          current_hash = hashlib.sha256(compressed).hexdigest()
+          print(f"Current compressed SHA-256: {current_hash}")
+
+          corrected_middle = middle
+          if current_hash != expected_compressed_hex:
+              # One character in the copied middle chunk was changed. A Base64 character affects
+              # only its 4-character quartet (3 decoded bytes), so test replacements without
+              # repeatedly decoding or reallocating the complete 41 KB payload.
+              found = None
+              prefix_length = len(prefix)
+              for local_position, original in enumerate(middle):
+                  global_position = prefix_length + local_position
+                  quartet_start = global_position - (global_position % 4)
+                  quartet = list(encoded[quartet_start:quartet_start + 4])
+                  byte_start = (quartet_start // 4) * 3
+                  original_bytes = bytes(compressed[byte_start:byte_start + 3])
+
+                  for candidate in alphabet:
+                      if candidate == original:
+                          continue
+                      changed = quartet.copy()
+                      changed[global_position - quartet_start] = candidate
+                      try:
+                          replacement = base64.b64decode("".join(changed), validate=True)
+                      except Exception:
+                          continue
+                      compressed[byte_start:byte_start + 3] = replacement
+                      if hashlib.sha256(compressed).digest() == expected_compressed:
+                          found = (local_position, original, candidate, bytes(compressed))
+                          break
+                  if found:
                       break
-              if repaired:
-                  break
+                  compressed[byte_start:byte_start + 3] = original_bytes
 
-          if repaired is None:
-              raise SystemExit(
-                  f"Unable to repair the one-character payload omission; candidates={sorted(candidate_positions)}"
-              )
+              if found is None:
+                  raise SystemExit("Could not recover the copied Momentum Music payload")
 
-          position, character, compressed = repaired
-          print(f"Repaired middle at offset {position} with {character!r}")
-          patch = lzma.decompress(compressed)
+              position, original, candidate, corrected = found
+              corrected_middle = middle[:position] + candidate + middle[position + 1:]
+              compressed = bytearray(corrected)
+              print(f"Recovered middle chunk at offset {position}: {original!r} -> {candidate!r}")
+
+          if hashlib.sha256(compressed).hexdigest() != expected_compressed_hex:
+              raise SystemExit("Recovered compressed payload does not match its trusted SHA-256")
+
+          patch = lzma.decompress(bytes(compressed))
           patch_hash = hashlib.sha256(patch).hexdigest()
           if patch_hash != expected_patch:
-              raise SystemExit(f"Unexpected patch SHA-256 after repair: {patch_hash}")
+              raise SystemExit(f"Unexpected patch SHA-256: {patch_hash}")
           Path("/tmp/momentum-music.patch").write_bytes(patch)
           print(f"Verified {len(patch)} byte Momentum Music patch")
           PY
