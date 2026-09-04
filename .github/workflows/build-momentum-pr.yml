@@ -69,7 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           cd app
-          git apply --index /tmp/momentum-music.patch
+          git apply --unidiff-zero --index /tmp/momentum-music.patch
           git diff --cached --check
 
       - name: Set up Node.js
