@@ -46,6 +46,10 @@ jobs:
           if len(parts) != 5:
               raise SystemExit(f"Expected 5 payload chunks, found {len(parts)}")
 
+          for part in parts:
+              data = part.read_bytes()
+              print(part.name, len(data), hashlib.sha256(data).hexdigest())
+
           compressed = base64.b64decode("".join(part.read_text().strip() for part in parts))
           compressed_hash = hashlib.sha256(compressed).hexdigest()
           if compressed_hash != "dd2e53fbebdfc736141f0c515c79419d8cadfcd3b978013d2e9fb7a276240a51":
