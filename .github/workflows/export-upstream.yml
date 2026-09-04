@@ -1,7 +1,7 @@
 name: Export Zuno 1.4.0 source
 
 on:
-  push:
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
