@@ -1,2 +1,2 @@
 Momentum Music Intel build
-trigger: 5
+trigger: 6
